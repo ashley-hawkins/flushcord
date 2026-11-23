@@ -53,7 +53,40 @@ MENTION_ROLE_RE = re.compile(r"<@&(\d+)>")
 MENTION_CHANNEL_RE = re.compile(r"<#(\d+)>")
 
 # Discord channel type -> Fluxer channel type.
-CHANNEL_TYPE_MAP = {0: 0, 2: 2, 4: 4, 5: 0, 13: 2, 15: 0}
+CHANNEL_TYPE_MAP = {0: 0, 2: 2, 4: 4, 5: 0, 13: 2, 15: 15, 16: 16}
+# Without native threads a forum/media channel is flattened to a text channel.
+FLAT_CHANNEL_TYPE_MAP = {**CHANNEL_TYPE_MAP, 15: 0, 16: 0}
+
+# Mirrors @fluxer/constants ChannelConstants.ChannelTypes / ThreadConstants.
+CHANNEL_GUILD_TEXT = 0
+CHANNEL_ANNOUNCEMENT_THREAD = 10
+CHANNEL_PUBLIC_THREAD = 11
+CHANNEL_PRIVATE_THREAD = 12
+THREAD_ONLY_CHANNEL_TYPES = frozenset({15, 16})  # GUILD_FORUM, GUILD_MEDIA
+THREAD_AUTO_ARCHIVE_DURATIONS = (60, 1440, 4320, 10080)
+DEFAULT_THREAD_AUTO_ARCHIVE_DURATION = 4320
+MAX_ACTIVE_THREADS_PER_GUILD = 1000
+MAX_THREAD_MEMBERS = 1000
+THREAD_MEMBER_IDS_PREVIEW_SIZE = 8
+MAX_APPLIED_TAGS_PER_THREAD = 5
+
+
+class ChannelFlags:
+    PINNED = 1 << 1
+    REQUIRE_TAG = 1 << 4
+    HIDE_MEDIA_DOWNLOAD_OPTIONS = 1 << 15
+
+
+class ThreadMemberFlags:
+    HAS_INTERACTED = 1 << 0
+
+
+class ServerMessageFlags:
+    HAS_THREAD = 1 << 5
+
+
+MESSAGE_TYPE_THREAD_CREATED = 18
+MESSAGE_TYPE_THREAD_STARTER = 21
 
 
 # Mirrors @fluxer/constants ChannelConstants.MessageAttachmentFlags.
@@ -66,14 +99,19 @@ class MessageAttachmentFlags:
 # Message types Fluxer accepts (MessageTypeSchema): DEFAULT, RECIPIENT_ADD,
 # RECIPIENT_REMOVE, CALL, CHANNEL_NAME_CHANGE, CHANNEL_ICON_CHANGE,
 # CHANNEL_PINNED_MESSAGE, USER_JOIN, REPLY. Discord emits other types
-# (e.g. 18 THREAD_CREATED, 21 THREAD_STARTER_MESSAGE, 20 APPLICATION_COMMAND)
-# that Fluxer's response schema rejects, 500-ing the whole channel fetch.
+# (e.g. 20 APPLICATION_COMMAND) that Fluxer's response schema rejects,
+# 500-ing the whole channel fetch.
 ALLOWED_MESSAGE_TYPES = frozenset({0, 1, 2, 3, 4, 5, 6, 7, 19})
+# With native threads, 18 THREAD_CREATED is a real stored message (see
+# ThreadCreationService.createThreadCreatedMessage). 21 THREAD_STARTER_MESSAGE
+# is never stored: Fluxer derives it from the thread id (see _migrate_one_message).
+NATIVE_THREAD_MESSAGE_TYPES = ALLOWED_MESSAGE_TYPES | {MESSAGE_TYPE_THREAD_CREATED}
 
 
-def coerce_message_type(raw):
+def coerce_message_type(raw, native_threads=False):
     t = int(raw or 0)
-    return t if t in ALLOWED_MESSAGE_TYPES else 0
+    allowed = NATIVE_THREAD_MESSAGE_TYPES if native_threads else ALLOWED_MESSAGE_TYPES
+    return t if t in allowed else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +192,31 @@ def preflight(cfg, owner_id=None, want_s3=True):
             ok(f"backup DB readable ({db.message_count()} messages)")
     except Exception as e:  # noqa: BLE001
         bad(f"cannot open backup DB at {cfg.backup_db}: {e}")
+
+    # 2b. Thread strategy, and (for native threads) a Fluxer schema that has them
+    if cfg.thread_mode not in ("native", "channel", "skip"):
+        bad(f"options.thread_mode {cfg.thread_mode!r} must be native, channel or skip")
+    elif cfg.thread_mode == "native":
+        try:
+            sch = Schema(cfg.schema_path)
+            absent = [t for t in ("thread_state", "thread_stats", "thread_members",
+                                  "threads_by_parent", "thread_parent_config")
+                      if t not in sch.tables]
+            if absent:
+                bad(f"schema has no native thread tables ({absent}); update the "
+                    "Fluxer checkout or set options.thread_mode to \"channel\"")
+            else:
+                ok("schema has native thread tables")
+        except Exception:  # noqa: BLE001
+            pass  # already reported by the schema check
+        if db is not None:
+            try:
+                have = {r[1] for r in db.conn.execute("PRAGMA table_info(threads)")}
+                if db.threads() and "owner_id" not in have:
+                    warn("backup predates thread owners/flags (older disco-reaper); "
+                         "thread owners fall back to the first poster")
+            except Exception:  # noqa: BLE001
+                pass
 
     # 3. Backup media directory (needed for attachment/emoji/sticker uploads)
     if want_s3:
@@ -307,6 +370,12 @@ class Migrator:
         # per-channel running state: channel_id -> (max_msg_id, max_bucket)
         self.channel_last = {}
         self.channel_buckets = {}  # channel_id -> set(bucket)
+        # Native threads: ids of threads started from a message in their parent
+        # (that message gets HAS_THREAD), and parent -> [(thread_id, name)] used
+        # to point THREAD_CREATED messages at their thread.
+        self._thread_source_ids = set()
+        self._threads_by_parent_name = {}
+        self._claimed_thread_created = set()
         # Custom emoji ids that are animated (for reaction rendering).
         self._animated_emoji_ids = {
             int(a["id"]) for a in self.db.server_assets("emoji")
@@ -489,12 +558,20 @@ class Migrator:
         ch = channels_by_id.get(int(discord_channel_id))
         return ch.get("category_id") if ch else None
 
+    @property
+    def native_threads(self):
+        return self.cfg.thread_mode == "native"
+
     def migrate_channels(self):
         channels = self.db.channels()
         channels_by_id = {int(c["id"]): c for c in channels}
+        type_map = CHANNEL_TYPE_MAP if self.native_threads else FLAT_CHANNEL_TYPE_MAP
+        self._fluxer_types = {}
+        self._parent_configs = {}
         for c in channels:
             dtype = int(c.get("type") or 0)
-            ftype = CHANNEL_TYPE_MAP.get(dtype, 0)
+            ftype = type_map.get(dtype, 0)
+            self._fluxer_types[int(c["id"])] = ftype
             row = {
                 "channel_id": int(c["id"]),
                 "soft_deleted": False,
@@ -511,16 +588,28 @@ class Migrator:
                 "version": 1,
             }
             self.kv.upsert("channels", row)
-            self.kv.upsert(
-                "channels_by_guild_id",
-                {"guild_id": self.guild_id, "channel_id": int(c["id"])},
+            # Mirrors ChannelDataRepository.afterWrite: thread-only channels
+            # are indexed in their own table, not in channels_by_guild_id.
+            index_table = (
+                "thread_only_channels_by_guild"
+                if ftype in THREAD_ONLY_CHANNEL_TYPES
+                else "channels_by_guild_id"
             )
+            self.kv.upsert(index_table, {"guild_id": self.guild_id, "channel_id": int(c["id"])})
+            if self.native_threads:
+                cfg_row = self._parent_config_row(c, ftype)
+                if cfg_row:
+                    self._parent_configs[int(c["id"])] = cfg_row
         print(f"Migrated {len(channels)} channels")
 
+        if self.cfg.thread_mode == "native":
+            self._migrate_threads_native(channels_by_id)
+        elif self.cfg.thread_mode == "channel":
+            self._migrate_threads_as_channels(channels_by_id)
+
+    def _migrate_threads_as_channels(self, channels_by_id):
         threads = self.db.threads()
         for t in threads:
-            if self.cfg.thread_mode != "channel":
-                continue
             parent_category = self._channel_category(t["parent_id"], channels_by_id)
             row = {
                 "channel_id": int(t["id"]),
@@ -540,6 +629,268 @@ class Migrator:
             )
         if threads:
             print(f"Migrated {len(threads)} threads as channels")
+
+    # -- native threads / forums ---------------------------------------------
+    #
+    # Mirrors ThreadRepository.create() (fluxer_api/src/api/channel/
+    # repositories/ThreadRepository.ts) and ThreadCreationService: a thread is a
+    # `channels` row (type 10/11/12) plus thread_state, threads_by_parent, the
+    # active/archived index, members (+ by_user), stats and the parent's
+    # thread_parent_config.has_threads.
+
+    def _parent_config_row(self, c, ftype):
+        """thread_parent_config row for a channel that can parent threads."""
+        cid = int(c["id"])
+        row = {"guild_id": self.guild_id, "channel_id": cid}
+        auto = c.get("default_auto_archive_duration")
+        if auto in THREAD_AUTO_ARCHIVE_DURATIONS:
+            row["default_auto_archive_duration"] = int(auto)
+        slow = c.get("default_thread_slowmode_delay")
+        if slow:
+            row["default_thread_rate_limit_per_user"] = int(slow)
+        if ftype not in THREAD_ONLY_CHANNEL_TYPES:
+            return row if len(row) > 2 else None
+
+        tags = []
+        for t in self.db.forum_tags(cid):
+            emoji_id = int(t["emoji_id"]) if t.get("emoji_id") else None
+            emoji_name = t.get("emoji_name")
+            if emoji_name and not emoji_id:
+                emoji_name = self._emoji.surrogate(emoji_name) or emoji_name
+            tags.append({
+                "id": int(t["id"]),
+                "name": t.get("name") or "tag",
+                "moderated": bool(t.get("moderated")),
+                "emoji_id": emoji_id,
+                "emoji_name": emoji_name,
+            })
+        row["available_tags"] = tags or None
+        # Only the flags Fluxer lets a forum/media channel carry
+        # (settableChannelFlags); REQUIRE_TAG needs a tag a non-moderator can use.
+        settable = ChannelFlags.REQUIRE_TAG
+        if ftype == 16:
+            settable |= ChannelFlags.HIDE_MEDIA_DOWNLOAD_OPTIONS
+        flags = int(c.get("flags") or 0) & settable
+        if flags & ChannelFlags.REQUIRE_TAG and not any(not t["moderated"] for t in tags):
+            flags &= ~ChannelFlags.REQUIRE_TAG
+        row["flags"] = flags
+        emoji = c.get("default_reaction_emoji")
+        if emoji:
+            try:
+                e = json.loads(emoji) if isinstance(emoji, str) else emoji
+                if e.get("id"):
+                    row["default_reaction_emoji_id"] = int(e["id"])
+                elif e.get("name"):
+                    row["default_reaction_emoji_name"] = (
+                        self._emoji.surrogate(e["name"]) or e["name"]
+                    )
+            except (ValueError, TypeError, AttributeError):
+                pass
+        if c.get("default_sort_order") is not None:
+            row["default_sort_order"] = int(c["default_sort_order"])
+        if ftype == 15 and c.get("default_layout") is not None:
+            row["default_forum_layout"] = int(c["default_layout"])
+        return row
+
+    def _thread_type(self, thread, parent_ftype):
+        """Fluxer thread type for a Discord thread under its mapped parent
+        (publicThreadTypeFor / resolveTextThreadType): announcement threads
+        need an announcement parent, which this tool maps to plain text."""
+        if int(thread.get("type") or CHANNEL_PUBLIC_THREAD) == CHANNEL_PRIVATE_THREAD \
+                and parent_ftype not in THREAD_ONLY_CHANNEL_TYPES:
+            return CHANNEL_PRIVATE_THREAD
+        return CHANNEL_PUBLIC_THREAD
+
+    def _migrate_threads_native(self, channels_by_id):
+        threads = self.db.threads()
+        self._thread_source_ids = set()
+        self._threads_by_parent_name = {}
+        if not threads and not self._parent_configs:
+            return
+
+        prepared = []
+        for t in threads:
+            tid = int(t["id"])
+            pid = int(t["parent_id"]) if t.get("parent_id") else None
+            ptype = self._fluxer_types.get(pid)
+            if ptype not in (CHANNEL_GUILD_TEXT, *THREAD_ONLY_CHANNEL_TYPES):
+                print(f"  ! skipped thread {tid} ({t.get('name')!r}): parent {pid} "
+                      "is not a text, forum or media channel in the backup")
+                self.stats["skipped"] += 1
+                continue
+            prepared.append((t, tid, pid, ptype))
+
+        # Last activity decides which threads stay active if the guild is over
+        # Fluxer's active-thread cap (the cap is only enforced by the API).
+        def last_activity(tid):
+            r = self.db.conn.execute(
+                "SELECT MAX(id) FROM messages WHERE channel_id = ?", (tid,)
+            ).fetchone()
+            return int(r[0]) if r and r[0] else tid
+
+        active = [x for x in prepared if not x[0].get("archived")]
+        overflow = set()
+        if len(active) > MAX_ACTIVE_THREADS_PER_GUILD:
+            active.sort(key=lambda x: last_activity(x[1]), reverse=True)
+            overflow = {x[1] for x in active[MAX_ACTIVE_THREADS_PER_GUILD:]}
+            print(f"  ! {len(active)} active threads exceed Fluxer's cap of "
+                  f"{MAX_ACTIVE_THREADS_PER_GUILD}; importing the {len(overflow)} "
+                  "least recently active as archived")
+
+        pinned_forums = set()
+        parents_with_threads = set()
+        newest_in_forum = {}
+        for t, tid, pid, ptype in prepared:
+            force_archive = tid in overflow
+            self._write_native_thread(t, tid, pid, ptype, force_archive,
+                                      pinned_forums, newest_in_forum)
+            parents_with_threads.add(pid)
+            self._threads_by_parent_name.setdefault(pid, []).append(
+                (tid, (t.get("name") or ""))
+            )
+
+        for pid in parents_with_threads:
+            self._parent_configs.setdefault(
+                pid, {"guild_id": self.guild_id, "channel_id": pid}
+            )["has_threads"] = True
+        for row in self._parent_configs.values():
+            self.kv.upsert("thread_parent_config", row)
+        # ThreadRepository.create(): a forum's last_message_id is the newest post.
+        for pid, newest in newest_in_forum.items():
+            self.kv.patch("channels", {"channel_id": pid, "soft_deleted": False},
+                          {"last_message_id": newest})
+        # Permissions are migrated verbatim from the backup (Discord's thread
+        # permission bits equal Fluxer's), so mark them seeded exactly as guild
+        # creation does; otherwise Fluxer would lazily rewrite every overwrite.
+        now = _now()
+        self.kv.upsert("guild_thread_state", {
+            "guild_id": self.guild_id,
+            "first_active_at": now,
+            "perms_seeded_at": now,
+        })
+        print(f"Migrated {len(prepared)} threads natively "
+              f"({len(self._parent_configs)} thread-capable channels)")
+
+    def _write_native_thread(self, t, tid, pid, ptype, force_archive,
+                             pinned_forums, newest_in_forum):
+        ttype = self._thread_type(t, ptype)
+        is_private = ttype == CHANNEL_PRIVATE_THREAD
+        forum_post = ptype in THREAD_ONLY_CHANNEL_TYPES
+        created_at = _ms_to_dt(snowflake_to_ms(tid))
+        authors = self.db.thread_authors(tid)
+
+        # Owner: backup owner_id -> mapped Fluxer user -> first mapped poster
+        # -> guild owner (Fluxer requires an owner_id).
+        owner = self.map_user(t.get("owner_id"))
+        if owner is None:
+            for author_id, _ in authors:
+                owner = self.map_user(author_id)
+                if owner:
+                    break
+        owner = owner or self.owner_id
+
+        # Members: the owner, plus everyone who posted (Fluxer auto-joins a
+        # sender with HAS_INTERACTED), each joined at their first message.
+        members = {owner: created_at}
+        for author_id, first_id in authors:
+            fid = self.map_user(author_id)
+            if fid and fid not in members:
+                members[fid] = _ms_to_dt(snowflake_to_ms(first_id))
+        member_ids = list(members)[:MAX_THREAD_MEMBERS]
+
+        has_starter = forum_post or self.db.message_exists(pid, tid)
+        if not forum_post and has_starter:
+            self._thread_source_ids.add(tid)
+
+        archived = bool(t.get("archived")) or force_archive
+        archive_ts = parse_ts(t["archive_timestamp"]) if t.get("archive_timestamp") else created_at
+        if force_archive and not t.get("archived"):
+            last = self.db.conn.execute(
+                "SELECT MAX(id) FROM messages WHERE channel_id = ?", (tid,)
+            ).fetchone()[0]
+            archive_ts = _ms_to_dt(snowflake_to_ms(last or tid))
+        auto = t.get("auto_archive_duration")
+        auto = int(auto) if auto in THREAD_AUTO_ARCHIVE_DURATIONS else DEFAULT_THREAD_AUTO_ARCHIVE_DURATION
+
+        flags = 0
+        if forum_post and (int(t.get("flags") or 0) & ChannelFlags.PINNED) \
+                and not archived and pid not in pinned_forums:
+            flags = ChannelFlags.PINNED  # Fluxer allows one pinned post per forum
+            pinned_forums.add(pid)
+            self.kv.upsert("forum_pinned_thread", {"parent_id": pid, "thread_id": tid})
+
+        applied = []
+        if forum_post and t.get("applied_tags"):
+            try:
+                known = {x["id"] for x in
+                         (self._parent_configs.get(pid, {}).get("available_tags") or [])}
+                applied = [int(x) for x in json.loads(t["applied_tags"]) if int(x) in known]
+            except (ValueError, TypeError):
+                applied = []
+            applied = applied[:MAX_APPLIED_TAGS_PER_THREAD]
+
+        self.kv.upsert("channels", {
+            "channel_id": tid,
+            "soft_deleted": False,
+            "guild_id": self.guild_id,
+            "type": ttype,
+            "name": (t.get("name") or "thread")[:100],
+            "parent_id": pid,
+            "owner_id": owner,
+            "rate_limit_per_user": int(t.get("slowmode_delay") or 0),
+            "version": 1,
+        })
+        self.kv.upsert("threads_by_parent", {
+            "parent_id": pid, "thread_id": tid, "guild_id": self.guild_id, "type": ttype,
+        })
+        state = {
+            "thread_id": tid,
+            "guild_id": self.guild_id,
+            "parent_id": pid,
+            "type": ttype,
+            "archived": archived,
+            "locked": bool(t.get("locked")),
+            "invitable": (True if t.get("invitable") is None else bool(t["invitable"]))
+            if is_private else None,
+            "auto_archive_duration": auto,
+            "archive_timestamp": archive_ts,
+            "created_at": created_at,
+            "flags": flags,
+            "applied_tags": applied or None,
+            "member_count": len(member_ids),
+            # previewWith([], ids): newest first, capped
+            "member_ids_preview": (list(reversed(member_ids))[:THREAD_MEMBER_IDS_PREVIEW_SIZE]
+                                   or None),
+            "has_starter": has_starter,
+            "state_version": 1,
+        }
+        self.kv.upsert("thread_state", state)
+        count = self.db.thread_message_count(tid)
+        self.kv.upsert("thread_stats", {
+            "thread_id": tid, "message_count": count, "total_message_sent": count,
+        })
+        for uid in member_ids:
+            self.kv.upsert("thread_members", {
+                "thread_id": tid, "user_id": uid, "guild_id": self.guild_id,
+                "parent_id": pid, "join_timestamp": members[uid],
+                "flags": ThreadMemberFlags.HAS_INTERACTED, "muted": False,
+            })
+            self.kv.upsert("thread_members_by_user", {
+                "user_id": uid, "guild_id": self.guild_id, "parent_id": pid,
+                "is_private": is_private, "thread_id": tid,
+            })
+        if archived:
+            self.kv.upsert("archived_threads_by_parent", {
+                "parent_id": pid, "is_private": is_private,
+                "archive_timestamp": archive_ts, "thread_id": tid,
+                "guild_id": self.guild_id,
+            })
+        else:
+            self.kv.upsert("active_threads_by_guild", {
+                "guild_id": self.guild_id, "thread_id": tid, "parent_id": pid, "type": ttype,
+            })
+        if forum_post and tid > newest_in_forum.get(pid, 0):
+            newest_in_forum[pid] = tid
 
     # -- emojis / stickers --------------------------------------------------
 
@@ -950,6 +1301,17 @@ class Migrator:
                 self.stats["skipped"] += 1
                 return
         message_id = int(m["id"])
+        mtype = int(m.get("type") or 0)
+        if self.native_threads and mtype == MESSAGE_TYPE_THREAD_STARTER:
+            # Fluxer derives a thread's starter message from the thread id
+            # (ThreadMessageResponses.getStarter); storing one 500s the fetch.
+            return
+        thread_created_ref = None
+        if self.native_threads and mtype == MESSAGE_TYPE_THREAD_CREATED:
+            thread_created_ref = self._thread_for_created_message(m, channel_id)
+            if thread_created_ref is None:
+                self.stats["skipped"] += 1  # thread not in the backup
+                return
         bucket = make_bucket(message_id)
         buckets.add(bucket)
         content = m.get("content") or ""
@@ -970,6 +1332,15 @@ class Migrator:
                 "type": 0,
             }
 
+        if thread_created_ref is not None:
+            # createThreadCreatedMessage(): points at the thread channel, no message.
+            message_reference = {
+                "channel_id": thread_created_ref,
+                "message_id": None,
+                "guild_id": self.guild_id,
+                "type": 0,
+            }
+
         reaction_rows = self._reaction_rows(message_id)
         has_reaction = bool(reaction_rows)
 
@@ -978,11 +1349,12 @@ class Migrator:
             "bucket": bucket,
             "message_id": message_id,
             "author_id": author_fid,
-            "type": coerce_message_type(m.get("type")),
+            "type": coerce_message_type(m.get("type"), self.native_threads),
             "content": content,
             "edited_timestamp": None,
             "pinned_timestamp": pinned,
-            "flags": 0,
+            "flags": ServerMessageFlags.HAS_THREAD
+            if message_id in self._thread_source_ids else 0,
             "mention_everyone": me,
             "mention_users": mu or None,
             "mention_roles": mr or None,
@@ -1022,6 +1394,23 @@ class Migrator:
         if message_id > prev_id:
             self.channel_last[channel_id] = (message_id, bucket)
         self.stats["messages"] += 1
+
+    def _thread_for_created_message(self, m, channel_id):
+        """Thread a THREAD_CREATED message announces. Discord's reference (the
+        thread channel) isn't kept in the backup, so match by name: the newest
+        not-yet-claimed thread of this channel with that name created before
+        the message."""
+        message_id = int(m["id"])
+        name = (m.get("content") or "")
+        best = None
+        for tid, tname in self._threads_by_parent_name.get(channel_id, []):
+            if tname == name and tid <= message_id \
+                    and tid not in self._claimed_thread_created \
+                    and (best is None or tid > best):
+                best = tid
+        if best is not None:
+            self._claimed_thread_created.add(best)
+        return best
 
     def _reaction_rows(self, message_id):
         """Resolve the per-user reaction rows to write for a message.
@@ -1147,6 +1536,11 @@ class Migrator:
     _PURGE_GUILD_TABLES = [
         "guilds", "guild_roles", "guild_members", "guild_members_by_user_id",
         "channels", "channels_by_guild_id",
+        # native threads / forums
+        "thread_only_channels_by_guild", "thread_parent_config", "thread_state",
+        "threads_by_parent", "active_threads_by_guild",
+        "archived_threads_by_parent", "thread_members",
+        "thread_members_by_user", "guild_thread_state",
     ]
     # Tables keyed per channel/message; deleted by channel_id of our channels.
     _PURGE_CHANNEL_TABLES = [
@@ -1200,6 +1594,9 @@ class Migrator:
             if channel_ids:
                 for t in self._PURGE_CHANNEL_TABLES:
                     run_delete(t, "channel_id", channel_ids, array=True)
+                # Thread tables without a guild_id / channel_id column.
+                run_delete("thread_stats", "thread_id", channel_ids, array=True)
+                run_delete("forum_pinned_thread", "parent_id", channel_ids, array=True)
 
         print(f"Total rows deleted: {total}")
         if dry_run:
@@ -1226,6 +1623,11 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def _ms_to_dt(ms):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+
 # --------------------------------------------------------------------------- #
 # Verify
 # --------------------------------------------------------------------------- #
@@ -1243,7 +1645,8 @@ def verify(cfg):
     kv = KvStore(schema, cfg.pg_dsn, cfg.kv_table)
     with kv.conn.cursor() as cur:
         for table in ("messages", "channels", "guild_members", "guild_roles",
-                      "message_reactions", "attachment_lookup"):
+                      "message_reactions", "attachment_lookup", "thread_state",
+                      "thread_only_channels_by_guild"):
             cur.execute(
                 f"SELECT count(*) FROM {kv._ident} WHERE table_name = %s", (table,)
             )

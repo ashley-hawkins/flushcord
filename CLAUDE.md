@@ -33,8 +33,10 @@ reference — never modify it.
 
 ## Validated against Fluxer
 
-Commit **`e958cfe3`** (nearest tag `2026.710.164001`, branch `main`,
-2026-07-10). If the contributor's Fluxer is newer, re-read the encoding/schema/
+Core encoding/embeds: commit **`e958cfe3`** (nearest tag `2026.710.164001`,
+branch `main`, 2026-07-10). Native threads/forums: commit **`3608a387c`** (tag
+`fluxer-gateway@2026.1123.170446`, 2026-11-23) — not yet re-verified against a
+real instance. If the contributor's Fluxer is newer, re-read the encoding/schema/
 embed files below and check for drift before trusting parity.
 
 ## Fluxer source-of-truth map
@@ -52,6 +54,7 @@ Paths are relative to the local Fluxer checkout.
 | Unicode emoji FE0F form | `unicode_emojis.py` | `fluxer_app/src/media/data/emojis.json` |
 | GIF → KLIPY + proxy-URL signing | `klipy.py` | `fluxer_gifs/src/media_proxy.rs` (`external_proxy_url`); `fluxer_gifs/src/klipy.rs` |
 | YouTube link → `video` embed | `youtube.py` | `fluxer_unfurl/src/resolvers/youtube.rs`; limits in `fluxer_unfurl/src/{embed_normalizer,text_limits}.rs`; thumbnail metadata via `/_metadata` (`fluxer_unfurl/src/media_proxy.rs`) |
+| Native threads / forums | `migrate.py` (`_migrate_threads_native`, `_parent_config_row`) | `fluxer_api/src/api/channel/repositories/ThreadRepository.ts` (`create`), `.../services/thread/ThreadCreationService.ts` (`createThreadCreatedMessage`, `storeThread`), `.../services/thread/ThreadParentSettings.ts`, `database/types/ThreadTypes.ts`, `packages/constants/src/ThreadConstants.ts`; forum/media channels are indexed in `thread_only_channels_by_guild` (`ChannelDataRepository.afterWrite`); guild marker `guild_thread_state` (`ChannelThreadsGate.ts`, `SeedThreadPermissions.ts`) |
 | **Embed render contract** (easy to miss) | embeds built in `migrate.py` / `klipy.py` / `youtube.py` | `fluxer_app/src/features/channel/components/embeds/channel_embed/ChannelEmbedShared.ts` — `isValidMedia` requires `proxy_url` **and** `url` **and** `width` **and** `height`; `.../EmbedMediaRenderer.tsx`; `packages/schema/src/domains/message/EmbedSchemas.ts` |
 
 `README.md`'s "Module layout" has a one-line summary of each module; this table

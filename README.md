@@ -75,9 +75,19 @@ scheme the app uses (`attachments/{channel_id}/{attachment_id}/{filename}`).
   `user_map`. Author, mentions, and membership all go through this map.
   **The mapped Fluxer users must exist** for members/messages to render
   (preflight checks this).
-- **Threads → channels.** Fluxer has no native threads. Each Discord thread
-  becomes a text channel (name prefixed with `🧵`), nested under the same
-  category as its parent channel (`--thread`/`FLUSHCORD_THREAD_MODE`).
+- **Threads and forums are native.** Fluxer has real threads, forum and media
+  channels, so each Discord thread becomes a Fluxer thread (type 11, or 12 for
+  private) under its parent, forums/media become `GUILD_FORUM`/`GUILD_MEDIA` with
+  their tags, layout, sort order, default reaction and "require tag" flag, and
+  forum posts keep their tags, pin and archive state. Threads started from a
+  message keep that link (the source message gets `HAS_THREAD`, and Discord's
+  "thread created" system message points at the thread). Members are the thread
+  owner plus everyone who posted. Archived threads stay archived; if more than
+  Fluxer's 1,000-active-thread cap are active, the least recently active are
+  imported as archived. Set `options.thread_mode` to `channel` for the old
+  behaviour (each thread flattened into a `🧵` text channel, forums to text
+  channels) or `skip` to drop threads. Only public threads are in a backup, plus
+  any private ones the bot could see.
 - **Reactions.** If the backup records the reacting users (`reactions.user_ids`),
   the default `real` mode reproduces them faithfully — one row per (emoji, user),
   mapping each reacting Discord user through the user map (unmapped reactors are
@@ -316,7 +326,8 @@ rows behind (there is no background worker that cleans them up later).
 | roles            | `guild_roles`                                                                      |
 | users (mapped)   | `guild_members`, `guild_members_by_user_id`                                        |
 | channels         | `channels`, `channels_by_guild_id`                                                 |
-| threads          | `channels` (as text channels)                                                      |
+| threads          | `channels`, `thread_state`, `thread_stats`, `thread_members`(`_by_user`), `threads_by_parent`, `active_threads_by_guild` / `archived_threads_by_parent` |
+| forum/media      | `channels`, `thread_only_channels_by_guild`, `thread_parent_config`, `forum_pinned_thread` |
 | permissions      | `channels.permission_overwrites`                                                   |
 | messages         | `messages`, `messages_by_author_id_v2`, `channel_message_buckets`, `channel_state` |
 | attachments      | S3 CDN object + `attachment_lookup` + `messages.attachments`                       |

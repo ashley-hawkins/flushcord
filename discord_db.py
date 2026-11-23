@@ -45,6 +45,43 @@ class DiscordBackup:
     def threads(self):
         return self._all("SELECT * FROM threads")
 
+    def forum_tags(self, forum_id):
+        """Tag definitions of a forum channel (empty on backups predating them)."""
+        try:
+            return self._all(
+                "SELECT * FROM forum_tags WHERE forum_id = ? ORDER BY id", (forum_id,)
+            )
+        except sqlite3.OperationalError:
+            return []
+
+    def message_exists(self, channel_id, message_id):
+        return self.conn.execute(
+            "SELECT 1 FROM messages WHERE channel_id = ? AND id = ? LIMIT 1",
+            (channel_id, message_id),
+        ).fetchone() is not None
+
+    def thread_message_count(self, thread_id):
+        """Messages Fluxer counts for a thread: everything except the thread's
+        own first message (id == thread id) and Discord's virtual starter
+        message (type 21), which Fluxer derives instead of storing."""
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE channel_id = ? AND id != ? "
+            "AND COALESCE(type, 0) != 21",
+            (thread_id, thread_id),
+        ).fetchone()[0]
+
+    def thread_authors(self, thread_id):
+        """(author_id, first_message_id) per author, in order of first post."""
+        return [
+            (r[0], r[1])
+            for r in self.conn.execute(
+                "SELECT author_id, MIN(id) FROM messages WHERE channel_id = ? "
+                "AND COALESCE(type, 0) != 21 AND author_id IS NOT NULL "
+                "GROUP BY author_id ORDER BY MIN(id)",
+                (thread_id,),
+            ).fetchall()
+        ]
+
     def users(self):
         return self._all("SELECT * FROM users")
 

@@ -45,7 +45,9 @@ class Config:
     guild_owner_user_id: int = 0  # Fluxer user id that owns the imported guild
 
     # --- Strategies ---
-    thread_mode: str = "channel"
+    # 'native' -> Fluxer threads / forum posts, 'channel' -> flatten each thread
+    # into a text channel (pre-native-threads behaviour), 'skip' -> drop threads.
+    thread_mode: str = "native"
     thread_name_prefix: str = "🧵 "
     reaction_mode: str = "real"  # 'real' | 'owner' | 'skip'
     upload_attachments: bool = True

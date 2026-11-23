@@ -27,7 +27,7 @@
   },
   "owner_user_id": 0,
   "options": {
-    "thread_mode": "channel",
+    "thread_mode": "native",
     "thread_name_prefix": "🧵 ",
     "reaction_mode": "owner",
     "unmapped_author_mode": "owner",
