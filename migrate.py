@@ -29,12 +29,14 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 import psycopg2
 
 from config import load_config, write_user_map
 from discord_db import DiscordBackup, parse_ts, snowflake_to_ms
 from kvstore import KvStore
+from progress import Progress
 from schema import Schema
 from snowflake import make_bucket
 from s3uploader import S3Uploader, cdn_key
@@ -418,6 +420,7 @@ class Migrator:
         self.stats = {"messages": 0, "attachments": 0, "reactions": 0,
                       "skipped": 0, "gifs": 0, "gif_misses": 0,
                       "youtube": 0, "youtube_misses": 0}
+        self.progress = Progress()
 
     def close(self):
         self.db.close()
@@ -1265,11 +1268,25 @@ class Migrator:
 
     def migrate_messages(self):
         channels = self.db.distinct_message_channels()
+        names = {int(c["id"]): c.get("name") for c in self.db.channels()}
+        thread_ids = set()
+        for t in self.db.threads():
+            names[int(t["id"])] = t.get("name")
+            thread_ids.add(int(t["id"]))
+        progress = self.progress
+        progress.begin_messages(self.db.message_count())
+        print(f"== messages: {progress.total:,} across {len(channels)} channels")
         for ci, channel_id in enumerate(channels, 1):
             channel_id = int(channel_id)
             msgs = self.db.messages(channel_id)
+            kind = "thread" if channel_id in thread_ids else "channel"
+            label = f"{kind} #{names.get(channel_id) or channel_id}"
+            progress.set_phase(label)
+            print(f"[{ci}/{len(channels)}] {label}: starting, {len(msgs):,} messages")
+            started = time.monotonic()
+            last_log = started
             buckets = set()
-            for m in msgs:
+            for mi, m in enumerate(msgs, 1):
                 try:
                     self._migrate_one_message(m, channel_id, buckets)
                 except psycopg2.Error:
@@ -1280,6 +1297,12 @@ class Migrator:
                     # Malformed source row: log, skip, keep going.
                     print(f"  ! skipped message {m.get('id')}: {e}")
                     self.stats["skipped"] += 1
+                progress.advance()
+                # Big channels: a line every ~10s so a long one doesn't look hung.
+                now = time.monotonic()
+                if now - last_log >= 10 and mi < len(msgs):
+                    last_log = now
+                    print(f"  {label}: {mi:,}/{len(msgs):,}")
             # Record bucket index rows for this channel.
             for b in buckets:
                 self.kv.upsert(
@@ -1289,7 +1312,10 @@ class Migrator:
             self.kv.commit()
             if self._klipy:
                 self._klipy.save_cache()  # persist resolutions incrementally
-            print(f"[{ci}/{len(channels)}] channel {channel_id}: {len(msgs)} messages")
+            print(f"[{ci}/{len(channels)}] {label}: done, {len(msgs):,} messages "
+                  f"in {time.monotonic() - started:.1f}s")
+            progress.log_plain()
+        progress.set_phase("finalizing channel state")
         self._finalize_channel_state()
 
     def _migrate_one_message(self, m, channel_id, buckets):
@@ -1494,14 +1520,26 @@ class Migrator:
         print(f"Finalized channel_state for {len(self.channel_last)} channels")
 
     def run(self):
+        self.progress.start()
+        try:
+            self._run()
+        finally:
+            self.progress.stop()
+
+    def _run(self):
         if self.s3:
             self.s3.ensure_bucket()
-        self.migrate_guild()
-        self.migrate_roles()
-        self.migrate_members()
-        self.migrate_channels()
-        self.migrate_emojis()
-        self.migrate_stickers()
+        for label, step in (
+            ("guild", self.migrate_guild),
+            ("roles", self.migrate_roles),
+            ("members", self.migrate_members),
+            ("channels", self.migrate_channels),
+            ("emojis", self.migrate_emojis),
+            ("stickers", self.migrate_stickers),
+        ):
+            self.progress.set_phase(f"setting up: {label}")
+            print(f"== {label}")
+            step()
         self.kv.commit()
         self.migrate_messages()
         if self._klipy:

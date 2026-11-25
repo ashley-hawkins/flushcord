@@ -373,6 +373,7 @@ owner (the backup has no per-asset creator).
 - `klipy.py` — Tenor → KLIPY GIF conversion (mirrors `fluxer_gifs`)
 - `youtube.py` — YouTube link → `video` embed (mirrors `fluxer_unfurl`'s resolver)
 - `s3uploader.py` — attachment uploads to the CDN bucket
+- `progress.py` — overall message-count progress line pinned to the bottom of the output
 - `config.py` — loads the per-server `config.json`
 - `migrate.py` — orchestrator + CLI
 
