@@ -59,6 +59,11 @@ CHANNEL_TYPE_MAP = {0: 0, 2: 2, 4: 4, 5: 0, 13: 2, 15: 15, 16: 16}
 # Without native threads a forum/media channel is flattened to a text channel.
 FLAT_CHANNEL_TYPE_MAP = {**CHANNEL_TYPE_MAP, 15: 0, 16: 0}
 
+# DEFAULT_PERMISSIONS | DEFAULT_THREAD_PERMISSIONS: the @everyone permissions
+# Fluxer gives a new guild (GuildOperationsService). Value taken from Fluxer
+# commit 3608a387c (packages/constants ChannelConstants / ThreadPermissionUtils).
+EVERYONE_DEFAULT_PERMISSIONS = 18014914009747009
+
 # Mirrors @fluxer/constants ChannelConstants.ChannelTypes / ThreadConstants.
 CHANNEL_GUILD_TEXT = 0
 CHANNEL_ANNOUNCEMENT_THREAD = 10
@@ -462,6 +467,29 @@ class Migrator:
 
     def migrate_roles(self):
         roles = self.db.roles()
+        # @everyone's role id is the guild id (Fluxer: guildIdToRoleId). Newer
+        # backups store it with the server's real permissions; for older ones
+        # fall back to what Fluxer gives a freshly created guild.
+        everyone = next((r for r in roles if int(r["id"]) == self.guild_id), None)
+        everyone_perms = (
+            int(everyone.get("permissions") or 0) if everyone else EVERYONE_DEFAULT_PERMISSIONS
+        )
+        self.kv.upsert("guild_roles", {
+            "guild_id": self.guild_id,
+            "role_id": self.guild_id,
+            "name": "@everyone",
+            "permissions": everyone_perms,
+            "position": 0,
+            "hoist_position": None,
+            "color": 0,
+            "hoist": False,
+            "mentionable": False,
+            "version": 1,
+        })
+        print("  @everyone: " + (
+            "from backup" if everyone else "not in backup, using Fluxer's default permissions"
+        ))
+        roles = [r for r in roles if int(r["id"]) != self.guild_id]
         for r in roles:
             row = {
                 "guild_id": self.guild_id,
