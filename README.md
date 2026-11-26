@@ -244,8 +244,21 @@ Tenor link and fills the cache, so the real migration is faster:
 #   --no-attachments        skip S3 uploads (records only available files)
 #   --reactions skip|real|owner  reaction strategy (default: real)
 #   --dry-run               roll back DB writes at the end
+#   --only <stages>         run only some stages (see below)
 #   --skip-preflight        bypass the pre-migration validation checks
 ```
+
+`--only` takes a comma-separated list from `guild, roles, members, channels,
+emojis, stickers, messages`. The chosen stages always run in that order,
+whatever order you list them in. Every write is an upsert, so re-running a stage
+is safe, e.g. to refresh just the roles:
+
+```bash
+.venv/bin/python migrate.py --config myserver.json migrate --only roles
+```
+
+A stage needs the rows of the stages before it to exist already (`messages`
+needs `channels`, for example), so use it on a guild that has been migrated once.
 
 ### 5. Verify
 

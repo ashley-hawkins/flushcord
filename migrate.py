@@ -64,6 +64,21 @@ FLAT_CHANNEL_TYPE_MAP = {**CHANNEL_TYPE_MAP, 15: 0, 16: 0}
 # commit 3608a387c (packages/constants ChannelConstants / ThreadPermissionUtils).
 EVERYONE_DEFAULT_PERMISSIONS = 18014914009747009
 
+# Stages of `migrate`, in the order they run (`--only` picks a subset).
+STAGES = ("guild", "roles", "members", "channels", "emojis", "stickers", "messages")
+
+
+def stage_list(value):
+    """argparse type for --only: comma-separated stage names."""
+    names = [n.strip().lower() for n in value.split(",") if n.strip()]
+    bad = [n for n in names if n not in STAGES]
+    if bad or not names:
+        raise argparse.ArgumentTypeError(
+            f"unknown stage(s) {', '.join(bad) or repr(value)}; "
+            f"choose from: {', '.join(STAGES)}"
+        )
+    return names
+
 # Mirrors @fluxer/constants ChannelConstants.ChannelTypes / ThreadConstants.
 CHANNEL_GUILD_TEXT = 0
 CHANNEL_ANNOUNCEMENT_THREAD = 10
@@ -365,8 +380,9 @@ def preflight(cfg, owner_id=None, want_s3=True):
 # --------------------------------------------------------------------------- #
 
 class Migrator:
-    def __init__(self, cfg):
+    def __init__(self, cfg, only=None):
         self.cfg = cfg
+        self.only = set(only) if only else None  # None = every stage
         self.schema = Schema(cfg.schema_path)
         self.db = DiscordBackup(cfg.backup_db)
         self.kv = KvStore(self.schema, cfg.pg_dsn, cfg.kv_table)
@@ -1555,8 +1571,20 @@ class Migrator:
             self.progress.stop()
 
     def _run(self):
-        if self.s3:
+        def wanted(stage):
+            return self.only is None or stage in self.only
+
+        if self.only is not None:
+            print("Running only: " + ", ".join(s for s in STAGES if wanted(s)))
+        if self.s3 and any(wanted(s) for s in ("emojis", "stickers", "messages")):
             self.s3.ensure_bucket()
+        if not wanted("guild"):
+            # Later stages key everything on the guild id; read it without
+            # rewriting the guild row.
+            g = self.db.guild()
+            if not g:
+                sys.exit("No guild_profile row in backup.")
+            self.guild_id = int(g["id"])
         for label, step in (
             ("guild", self.migrate_guild),
             ("roles", self.migrate_roles),
@@ -1565,10 +1593,15 @@ class Migrator:
             ("emojis", self.migrate_emojis),
             ("stickers", self.migrate_stickers),
         ):
+            if not wanted(label):
+                continue
             self.progress.set_phase(f"setting up: {label}")
             print(f"== {label}")
             step()
         self.kv.commit()
+        if not wanted("messages"):
+            print("\nDone. Stats:", json.dumps(self.stats))
+            return
         self.migrate_messages()
         if self._klipy:
             self._klipy.save_cache()
@@ -2030,6 +2063,12 @@ def main():
     mig.add_argument("--reactions", choices=["skip", "real", "owner"],
                      help="reaction strategy (default: real)")
     mig.add_argument("--dry-run", action="store_true", help="rollback at the end")
+    mig.add_argument("--only", type=stage_list, metavar="STAGES",
+                     help="run only these stages, comma-separated, always in the "
+                          f"normal order ({', '.join(STAGES)}). Every stage is an "
+                          "upsert, so re-running one is safe; a stage only needs "
+                          "the rows of earlier stages to already exist (e.g. "
+                          "messages needs channels)")
     mig.add_argument("--skip-preflight", action="store_true",
                      help="skip the pre-migration validation checks")
 
@@ -2124,7 +2163,7 @@ def main():
                      "--skip-preflight to override.")
         print()
 
-    m = Migrator(cfg)
+    m = Migrator(cfg, only=args.only)
     try:
         m.run()
         if args.dry_run:
